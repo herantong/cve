@@ -1,0 +1,171 @@
+# Path Traversal in static_content visual_selector_data Handler (CWE-22)
+
+**BUG_Author:** herantong
+
+**Affected Version:** changedetection.io ≤ 0.55.8
+
+**Vendor:** [changedetection.io GitHub Repository](https://github.com/dgtlmoon/changedetection.io)
+
+**Software:** [changedetection.io](https://github.com/dgtlmoon/changedetection.io)
+
+**Vulnerability Files:**
+- `changedetectionio/flask_app.py`
+
+---
+
+## Description
+
+### 1. Path Traversal via Unsanitized Filename in visual_selector_data
+
+The `static_content()` handler at `/static/<string:group>/<string:filename>` uses the unvalidated `filename` route parameter to construct a directory path via `os.path.join(datastore_o.datastore_path, filename)`. When `group` is `visual_selector_data`, the resulting `watch_directory` path is passed directly as the **directory** argument to `send_from_directory()`. An attacker can supply traversal sequences (e.g., `..`) to escape the datastore directory and read `elements.deflate` files belonging to other watches or arbitrary directories (CWE-22).
+
+### 2. Vulnerable Code Location
+
+The vulnerability is in `changedetectionio/flask_app.py`, lines 877-904:
+
+```python
+# changedetectionio/flask_app.py:819-826
+@app.route("/static/<string:group>/<string:filename>", methods=['GET'])
+def static_content(group, filename):
+    from flask import make_response
+    import re
+
+    group = re.sub(r'[^a-z0-9_-]+', '', group.lower())
+    filename = filename  # <-- NO sanitization applied
+
+    if not group or not filename:
+        abort(404)
+```
+
+Only the `group` parameter is sanitized via regex. The `filename` assignment is a no-op, leaving the parameter completely unfiltered.
+
+```python
+# changedetectionio/flask_app.py:877-889
+        if group == 'visual_selector_data':
+            if datastore.data['settings']['application']['password'] and not flask_login.current_user.is_authenticated:
+                abort(403)
+
+            try:
+                watch_directory = str(os.path.join(datastore_o.datastore_path, filename))
+                response = None
+                if os.path.isfile(os.path.join(watch_directory, "elements.deflate")):
+                    response = make_response(send_from_directory(watch_directory, "elements.deflate"))
+```
+
+`watch_directory` is constructed by joining the datastore path with the attacker-controlled `filename`. It is then passed as the **directory** argument to `send_from_directory()`. The file name `"elements.deflate"` is hardcoded as the `path` argument.
+
+### 3. Violation of Werkzeug's send_from_directory Contract
+
+The project depends on `werkzeug==3.1.6`. The `send_from_directory` implementation explicitly warns:
+
+```python
+# werkzeug/utils.py
+def send_from_directory(directory, path, environ, **kwargs):
+    """Send a file from within a directory using send_file.
+
+    :param directory: The directory that ``path`` must be located under.
+        This *must not* be a value provided by the client, otherwise it
+        becomes insecure.
+    """
+    path_str = safe_join(os.fspath(directory), os.fspath(path))
+```
+
+The internal `safe_join` function only validates the **untrusted** `path` component (`"elements.deflate"`), not the `directory` parameter. By using client-provided `filename` to construct the `directory` argument, the code directly violates the documented security contract.
+
+### 4. No Path Normalization or Base Directory Validation
+
+The `visual_selector_data` branch performs no `os.path.realpath()`, `os.path.abspath()`, or `pathlib.Path.resolve()` followed by a `.startswith(datastore_o.datastore_path)` check. Only the raw `os.path.join` result is used:
+
+```python
+watch_directory = str(os.path.join(datastore_o.datastore_path, filename))
+```
+
+`os.path.join` does not normalize paths or verify that the result remains within the base directory. Any `..` components in `filename` will traverse upward.
+
+### 5. Missing UUID Validation and Watch Ownership Check
+
+The `favicon` branch (lines 853-875) performs a watch lookup to enforce ownership:
+
+```python
+# changedetectionio/flask_app.py:858-860
+watch = datastore.data['watching'].get(filename)
+if not watch:
+    abort(404)
+```
+
+The `visual_selector_data` branch performs no such lookup, no UUID validation, and no whitelist check. Any string accepted by the router is used directly.
+
+### 6. Existing Security Tests Do Not Cover the Vulnerable Branch
+
+The test `test_static_directory_traversal` in `changedetectionio/tests/test_security.py` only tests the generic static file fallback at the end of the function, where `send_from_directory` validates the `path` argument. It does not test the `visual_selector_data` or `screenshot` branches that construct the `directory` argument from unsanitized user input.
+
+---
+
+## Proof of Concept
+
+### 1. Traverse to Another Watch's visual_selector_data
+
+```
+GET http://<target-host>/static/visual_selector_data/../<other_watch_uuid>
+```
+
+The request reads `elements.deflate` from a different watch's directory, bypassing watch-level isolation.
+
+### 2. Traverse to Arbitrary Directories
+
+```
+GET http://<target-host>/static/visual_selector_data/../../../../tmp
+```
+
+If a file named `elements.deflate` exists under `/tmp`, its contents are served.
+
+### 3. Attack Flow
+
+1. An attacker identifies the `static_content` endpoint with `group=visual_selector_data`.
+2. The attacker provides a `filename` containing traversal sequences (`..`).
+3. `os.path.join(datastore_o.datastore_path, filename)` resolves to a directory outside the intended datastore.
+4. `send_from_directory(watch_directory, "elements.deflate")` serves the file from the escaped directory.
+5. The attacker reads visual selector data belonging to other monitored URLs or arbitrary files accessible to the process.
+
+---
+
+## Root Cause Analysis
+
+| Question | Answer |
+|---|---|
+| Does user-controlled input influence a file path? | Yes — `filename` is a Flask route parameter taken directly from the HTTP request URL. |
+| Is the path normalized and validated against a base directory? | No — only `os.path.join` is used; no `realpath`/`abspath` + `startswith(base)` check exists. |
+| Is `basename()` used to strip directory components? | No — the raw `filename` is used directly in `os.path.join`. |
+| Is there an effective filename whitelist? | No — no UUID validation or whitelist is applied in the `visual_selector_data` branch. |
+| Does `send_from_directory`'s documented security contract prohibit this pattern? | Yes — the `directory` parameter "must not be a value provided by the client." |
+| Does the same function contain a safe pattern elsewhere? | Yes — the `favicon` branch performs a watch lookup, confirming the missing check is a code-level defect. |
+| Is the code in a test, demo, or dead-code context? | No — it is a live production route handler. |
+
+**Verdict: Confirmed vulnerability (CWE-22 — Path Traversal).**
+
+---
+
+## Fix Recommendations
+
+1. **Validate `filename` as a Watch UUID**: Before constructing the path, validate that `filename` matches the expected watch UUID format (e.g., strict regex `^[a-f0-9-]{36}$`). Return 404 for non-matching input.
+
+2. **Adopt a Lookup-Based Approach**: Follow the `favicon` branch pattern and perform `watch = datastore.data['watching'].get(filename)`. Return 404 if the watch does not exist, ensuring only valid watches are accessible.
+
+3. **Add Normalization and Base Directory Validation**: After constructing the path, resolve it and verify it stays within the datastore root:
+   ```python
+   watch_directory = os.path.realpath(os.path.join(datastore_o.datastore_path, filename))
+   if not watch_directory.startswith(os.path.realpath(datastore_o.datastore_path) + os.sep):
+       abort(404)
+   ```
+
+4. **Apply the Same Fix to the `screenshot` Branch**: The identical unsafe pattern at lines 832-851 must be hardened consistently.
+
+5. **Update Security Tests**: Extend `test_static_directory_traversal` in `changedetectionio/tests/test_security.py` to cover traversal vectors for both the `visual_selector_data` and `screenshot` branches.
+
+---
+
+## References
+
+- [CWE-22: Improper Limitation of a Pathname to a Restricted Directory](https://cwe.mitre.org/data/definitions/22.html)
+- [Werkzeug `send_from_directory` documentation](https://werkzeug.palletsprojects.com/en/stable/utils/#werkzeug.utils.send_from_directory)
+- [Werkzeug `safe_join` source](https://github.com/pallets/werkzeug/blob/main/src/werkzeug/security.py)
