@@ -1,0 +1,193 @@
+# DOM-Based Cross-Site Scripting via XPath String in Visual Selector (CWE-79)
+
+**BUG_Author:** herantong
+
+**Affected Version:** changedetection.io ≤ 0.55.8
+
+**Vendor:** [changedetection.io GitHub Repository](https://github.com/dgtlmoon/changedetection.io)
+
+**Software:** [changedetection.io](https://github.com/dgtlmoon/changedetection.io)
+
+**Vulnerability Files:**
+- `changedetectionio/static/js/visual-selector.js`
+- `changedetectionio/content_fetchers/res/xpath_element_scraper.js`
+
+---
+
+## Description
+
+### 1. DOM-Based XSS via Unsanitized XPath Display
+
+The `setCurrentSelectedText` function in the visual selector component assigns a raw XPath string directly to `innerHTML` without any escaping. The XPath string originates from server-side scraping of attacker-controlled monitored pages. When a user hovers over a malicious element in the visual selector, a DOM-based XSS attack can be triggered (CWE-79).
+
+### 2. Vulnerable Code Location — Client-Side Sink
+
+The sink is at `changedetectionio/static/js/visual-selector.js:255-257`:
+
+```javascript
+function setCurrentSelectedText(s) {
+    $selectorCurrentXpathElem[0].innerHTML = s;
+}
+```
+
+The parameter `s` is assigned directly to `innerHTML` on a DOM element. No HTML escaping, `textContent` fallback, or sanitizer call exists. `innerHTML` parses its argument as HTML, so any string containing HTML tags or event handlers will be executed by the browser.
+
+### 3. Data Source — Mouse Move Handler
+
+The sole caller is `handleMouseMove` at line 245:
+
+```javascript
+function handleMouseMove(e) {
+    selectorData['size_pos'].forEach(sel => {
+        if (e.offsetY > sel.top * yScale && ...) {
+            setCurrentSelectedText(sel.xpath);
+            ...
+        }
+    })
+}
+```
+
+`sel.xpath` comes from `selectorData['size_pos']`, an array populated by `applyElementData`:
+
+```javascript
+function applyElementData(data) {
+    $fetchingUpdateNoticeElem.html(i18nT('vsRendering', "Rendering.."));
+    selectorData = data;
+}
+```
+
+`applyElementData` is called from two paths:
+1. `load()` at line 124: `applyElementData(source.xpathData)` — inline data from watch snapshot.
+2. `fetchData()` at line 158: `applyElementData(data)` — AJAX data from `xpathDataUrl`.
+
+The AJAX endpoint is served by `static_content` at `changedetectionio/flask_app.py:877-901`, returning the raw `elements.deflate` file (deflate-compressed JSON) with `Content-Type: application/json`, without any server-side sanitization.
+
+### 4. Server-Side XPath Generation with Attacker-Controlled Content
+
+The server scrapes monitored pages using `changedetectionio/content_fetchers/res/xpath_element_scraper.js`. XPath strings are built through two paths, both embedding attacker-controlled element IDs:
+
+**Path A — `getxpath(e)` (lines 14-29):**
+
+```javascript
+function getxpath(e) {
+    var n = e;
+    if (n && n.id) return '//*[@id="' + n.id + '"]';  // Line 16
+    ...
+}
+```
+
+If an element has an `id`, the function concatenates the raw `id` string directly into the XPath expression. If an attacker controls the monitored page, they can set an element ID to `"><img src=x onerror=alert(1)>`, producing the XPath string:
+
+```
+//*[@id="><img src=x onerror=alert(1)>"]
+```
+
+**Path B — `findUpTag(el)` (lines 31-73):**
+
+```javascript
+if ('' !== r.id) {
+    chained_css.unshift("#" + CSS.escape(r.id));
+}
+```
+
+`CSS.escape()` escapes only CSS metacharacters, not HTML special characters. The resulting CSS selector string still contains the raw `id` value and is parsed as HTML when assigned to `innerHTML`.
+
+### 5. No Sanitization on the Data Path
+
+Searching the entire client-side file and project reveals no use of `escape`, `sanitize`, `textContent`, or `DOMPurify` on xpath values before reaching the sink. The server stores scraped JSON as-is (`changedetectionio/model/Watch.py:1181-1197`) and serves it as-is (`changedetectionio/flask_app.py:877-901`). The client receives JSON, parses it, and passes `sel.xpath` directly to `innerHTML`.
+
+### 6. Code Context
+
+- The file is `changedetectionio/static/js/visual-selector.js`, a core production UI component.
+- Loaded by `edit.html` and `add-watch-ui.html` for live user interaction.
+- Active test coverage exists in `changedetectionio/tests/visualselector/test_fetch_data.py`.
+- `setCurrentSelectedText` is called on every mouse movement over the visual selector canvas.
+- Not test, demo, or dead code.
+
+---
+
+## Proof of Concept
+
+### 1. Create a Malicious Monitored Page
+
+Create a page containing an element with a malicious ID:
+
+```html
+<!-- Attacker-controlled monitored page -->
+<div id='"><img src=x onerror=alert(document.cookie)>'>Sensitive Content</div>
+```
+
+### 2. Add the Page as a Watch
+
+Add the malicious page as a watch in changedetection.io and enable visual selector scraping.
+
+### 3. Trigger the XSS
+
+1. Navigate to the watch's edit page and open the visual selector.
+2. Move the mouse over the element with the malicious ID.
+3. `handleMouseMove` fires, `sel.xpath` is retrieved as `//*[@id="><img src=x onerror=alert(document.cookie)>"]`.
+4. `setCurrentSelectedText` sets `innerHTML` to this string.
+5. The browser parses the `innerHTML`, creating an `<img>` element with `src="x"`.
+6. The image fails to load, triggering `onerror` and executing `alert(document.cookie)`.
+
+### 4. Attack Flow
+
+```
+Attacker-controlled monitored page:
+  <div id='"><img src=x onerror=alert(1)>'> ... </div>
+         │
+         ▼
+Server scrapes DOM → xpath_element_scraper.js:16:
+  '//*[@id="' + n.id + '"]'
+  → //*[@id="><img src=x onerror=alert(1)>"]
+         │
+         ▼
+Server stores xpathData as-is → served via /static/visual_selector_data/<uuid>
+         │
+         ▼
+Client loads JSON → visual-selector.js:256:
+  $selectorCurrentXpathElem[0].innerHTML = sel.xpath
+         │
+         ▼
+Browser parses innerHTML → <img> element created → onerror fires
+```
+
+---
+
+## Root Cause Analysis
+
+| Question | Answer |
+|---|---|
+| Does user-controlled data reach an HTML/JS output sink? | Yes — the monitored page's DOM (attacker-controlled) is scraped by the server, and the generated xpath strings reach `innerHTML` at `visual-selector.js:256`. |
+| Does the template engine auto-escape? | No — no template engine is involved in this client-side DOM manipulation path. The value is set directly via `element.innerHTML = string`. |
+| Is there explicit output encoding or sanitization on the data path? | No — no `htmlEscape`, `textContent`, `DOMPurify`, or other sanitizer is applied between the scraped DOM and the `innerHTML` assignment. |
+| Is the response Content-Type non-HTML (JSON, plain text)? | The raw data endpoint returns `application/json`, but data is consumed by the visual selector UI rendered as HTML. The JSON string is injected into an HTML element via `innerHTML`, making the actual output context HTML. |
+| Does `CSS.escape()` provide HTML escaping? | No — `CSS.escape()` escapes CSS metacharacters only, not HTML special characters like `<`, `>`, `"`. |
+| Does the server sanitize xpath data before storage? | No — scraped JSON is stored as-is and served as-is. |
+| Is the code in a test, demo, or dead-code context? | No — it is an active, reachable production UI component loaded by `edit.html` and `add-watch-ui.html`. |
+
+**Verdict: Confirmed vulnerability (CWE-79 — Cross-Site Scripting).**
+
+---
+
+## Fix Recommendations
+
+1. **Replace `innerHTML` with `textContent`**: Since `setCurrentSelectedText` is only used to display xpath strings as plain text, `textContent` is the correct and safe API. Change:
+   ```javascript
+   $selectorCurrentXpathElem[0].innerHTML = s;
+   ```
+   To:
+   ```javascript
+   $selectorCurrentXpathElem[0].textContent = s;
+   ```
+
+2. **If HTML Formatting Is Needed in the Future**: If xpath display later requires HTML formatting (e.g., syntax highlighting), explicitly sanitize the string using a trusted HTML sanitizer such as DOMPurify before assigning to `innerHTML`.
+
+3. **Post-Fix Regression Check**: Verify that hovering over elements whose IDs contain HTML special characters (`<`, `>`, `"`) displays those characters as plain text rather than parsing them as HTML.
+
+---
+
+## References
+
+- [CWE-79: Cross-Site Scripting](https://cwe.mitre.org/data/definitions/79.html)
+- [MDN: textContent vs innerHTML](https://developer.mozilla.org/en-US/docs/Web/API/Node/textContent)
