@@ -1,0 +1,194 @@
+# Stored Cross-Site Scripting via Double-Decoded Watch URL in Confirmation Modal (CWE-79)
+
+**BUG_Author:** herantong
+
+**Affected Version:** changedetection.io ≤ 0.55.8
+
+**Vendor:** [changedetection.io GitHub Repository](https://github.com/dgtlmoon/changedetection.io)
+
+**Software:** [changedetection.io](https://github.com/dgtlmoon/changedetection.io)
+
+**Vulnerability Files:**
+- `changedetectionio/blueprint/ui/templates/edit.html`
+- `changedetectionio/blueprint/ui/static/js/modal.js`
+- `changedetectionio/validate_url.py`
+
+---
+
+## Description
+
+### 1. Stored XSS via Double Entity Decoding in Confirmation Modal
+
+The clear history button uses a `data-confirm-message` attribute containing hardcoded HTML tags mixed with the Jinja2-escaped watch URL. When the browser parses HTML attributes, it decodes HTML entities. The `modal.js` library then reads this attribute and inserts it directly into `innerHTML` without escaping, causing a second layer of entity decoding. An attacker who controls the watch URL can inject HTML entity-encoded payloads that survive Jinja2 auto-escaping and URL validation, ultimately executing arbitrary JavaScript in the victim's browser (CWE-79).
+
+### 2. Vulnerable Code Location — Template Sink
+
+The vulnerability originates at `changedetectionio/blueprint/ui/templates/edit.html:553`:
+
+```html
+<a href="{{url_for('ui.clear_watch_history', uuid=uuid)}}"
+   class="pure-button button-error"
+   data-requires-confirm
+   data-confirm-type="warning"
+   data-confirm-title="{{ _('Clear History?') }}"
+   data-confirm-message="<p>{{ _('Are you sure you want to clear all history for:') }}</p><p><strong>{{ watch.get('url', 'this watch') }}</strong></p><p>{{ _('This will remove all snapshots and previous versions. This action cannot be undone.') }}</p>"
+   data-confirm-button="{{ _('Clear History') }}">{{ _('Clear History') }}</a>
+```
+
+The watch URL is rendered via `{{ watch.get('url', 'this watch') }}` inside an HTML attribute that contains literal `<p>` and `<strong>` tags. This placement defeats Jinja2 auto-escaping because the value is embedded in an HTML attribute that will later be read by JavaScript and re-inserted into the DOM.
+
+### 3. Vulnerable Code Location — Client-Side Sink
+
+`modal.js` reads the `data-confirm-message` attribute and inserts it directly into `innerHTML` without escaping:
+
+```javascript
+// modal.js — auto-attach handler
+$(document).ready(function() {
+  $(document).on('click', 'a[data-requires-confirm], button[data-requires-confirm]', function(e) {
+    e.preventDefault();
+    const $element = $(this);
+    const config = {
+      type: $element.attr('data-confirm-type') || 'danger',
+      title: $element.attr('data-confirm-title') || _modalT('confirmTitle', 'Confirm Action'),
+      message: $element.attr('data-confirm-message') || _modalT('proceedMessage', '<p>Are you sure you want to proceed?</p>'),
+      confirmText: $element.attr('data-confirm-button') || _modalT('confirm', 'Confirm'),
+      cancelText: $element.attr('data-cancel-button') || _modalT('cancel', 'Cancel'),
+      onConfirm: function() { ... }
+    };
+    ModalDialog.confirm(config);
+  });
+});
+
+// modal.js — ModalDialog.confirm (line 68)
+dialog.innerHTML = `
+  <div class="modal-header">
+    ...
+  </div>
+  <div class="modal-body" id="modal-body">
+    ${config.message}
+  </div>
+  ...
+`;
+```
+
+A `_modalEscapeHTML` function exists in `modal.js` but is only used in the `confirmDelete` and `confirmUnlink` methods, not in the generic `confirm` path used by the auto-attach handler.
+
+### 4. Double Decoding Attack Chain
+
+The attack exploits two layers of HTML entity decoding:
+
+1. **Template rendering**: Jinja2 auto-escapes the watch URL. For a URL containing `&lt;`, the template output in the HTML attribute becomes `&amp;lt;`.
+2. **Browser attribute parsing**: When the browser parses the rendered HTML, it decodes HTML entities in attribute values. `&amp;lt;` becomes `&lt;` in the DOM attribute.
+3. **innerHTML insertion**: `modal.js` reads the attribute value (`&lt;`) and inserts it into `innerHTML`. The browser parses the `innerHTML` string and decodes entities again: `&lt;` becomes `<`, `&gt;` becomes `>`, creating a real DOM element.
+
+### 5. Bypassing URL Validation
+
+The URL validator in `changedetectionio/validate_url.py:230-232` blocks raw `<` and `>` characters:
+
+```python
+if re.search(r'[<>]', test_url):
+    logger.warning(f'URL "{test_url}" contains suspicious characters')
+    return False
+```
+
+This prevents URLs containing literal `<script>` tags but does **not** block HTML entity references such as `&lt;`. A URL like `http://example.com#&lt;img/src=x/onerror=alert(1)&gt;` contains no raw `<` or `>` characters and passes validation. The `normalize_url_encoding` function preserves `&` and `;` in fragments, and `validators.url` accepts it as a valid URL.
+
+### 6. No Content-Security-Policy Mitigation
+
+The base template (`changedetectionio/templates/base.html`) does not set any `Content-Security-Policy` header. No `X-Frame-Options` or similar security headers are configured to mitigate inline event handler execution.
+
+### 7. Persistence and Impact
+
+The watch URL is persisted in the datastore via the API (`changedetectionio/api/Watch.py:475`) and UI forms. The stored malicious URL affects all authenticated users who visit the watch's edit page and click the clear history button. The edit page is accessible via `/edit/<uuid>` protected by `login_optionally_required`.
+
+---
+
+## Proof of Concept
+
+### 1. Store a Malicious Watch URL
+
+Create a watch with a URL containing HTML entity-encoded XSS payload:
+
+```
+POST http://<target-host>/api/v1/watch
+Content-Type: application/json
+
+{
+  "url": "http://example.com#&lt;img/src=x/onerror=alert(document.cookie)&gt;",
+  "tag": "test"
+}
+```
+
+The URL passes validation because it contains no raw `<` or `>` characters.
+
+### 2. Trigger the XSS
+
+1. Authenticate as any user and navigate to the watch's edit page: `http://<target-host>/edit/<watch_uuid>`
+2. Click the "Clear History" button.
+3. A confirmation modal appears. The `data-confirm-message` attribute is read and inserted into `innerHTML`.
+4. The double-decoded payload creates an `<img>` element with `src="x"` and `onerror` handler.
+5. The image fails to load, triggering the `onerror` handler and executing `alert(document.cookie)`.
+
+### 3. Attack Flow Diagram
+
+```
+User stores watch URL:
+  http://example.com#&lt;img/src=x/onerror=alert(1)&gt;
+         │
+         ▼
+URL validation: passes (no raw <>)
+         │
+         ▼
+Template rendering (Jinja2 auto-escape):
+  &lt; → &amp;lt;   in data-confirm-message attribute
+         │
+         ▼
+Browser attribute parsing (decode #1):
+  &amp;lt; → &lt;   in DOM attribute value
+         │
+         ▼
+modal.js reads attribute and sets innerHTML (decode #2):
+  &lt; → <   creates real <img> element
+         │
+         ▼
+img onerror fires: alert(1) executes
+```
+
+---
+
+## Root Cause Analysis
+
+| Question | Answer |
+|---|---|
+| Does user-controlled data reach an HTML/JS output point? | Yes — `watch.get('url')` flows from user input to `data-confirm-message` in `edit.html:553`, then to `innerHTML` in `modal.js:68`. |
+| Does the template engine auto-escape and is it not bypassed? | Jinja2 auto-escapes `{{ watch.get('url') }}` with no `\|safe` bypass, but auto-escaping is ineffective because the value is placed inside an HTML attribute containing literal HTML tags, and later re-inserted into `innerHTML` where a second decode occurs. |
+| Is there explicit output encoding/sanitization on the data path? | No — a `_modalEscapeHTML` function exists in `modal.js` but is not used in the generic `confirm` path that processes `data-confirm-message`. |
+| Is the response Content-Type non-HTML? | No — the edit page renders as `text/html`. |
+| Does URL validation block all XSS vectors? | No — only raw `<>` characters are blocked; HTML entity references like `&lt;` pass validation. |
+| Is there a CSP or other mitigation? | No — no `Content-Security-Policy` header is configured. |
+| Is the code in a test, demo, or dead-code context? | No — it is a production UI template and active JavaScript library. |
+
+**Verdict: Confirmed vulnerability (CWE-79 — Cross-Site Scripting).**
+
+---
+
+## Fix Recommendations
+
+1. **Escape User Data Before innerHTML Insertion**: In `modal.js`, apply `_modalEscapeHTML` to the `message` value before inserting it into `innerHTML`, or use `textContent` for the modal body instead of `innerHTML` if rich HTML formatting is not required.
+
+2. **Restructure Template Data Passing**: In `edit.html` and similar templates, do not embed user-controlled data inside HTML attributes that contain literal HTML tags destined for `innerHTML` rendering. Instead, pass the plain-text URL via a separate `data-*` attribute and construct the HTML message structure in `modal.js` around the escaped text.
+
+3. **Use textContent as a Defense-in-Depth Measure**: Setting the modal body content via `textContent` instead of `innerHTML` prevents all entity-based XSS injection by disabling HTML parsing entirely.
+
+4. **Add Content-Security-Policy Header**: Configure a CSP header in the base template to restrict inline event handlers, providing an additional layer of protection.
+
+5. **Apply Consistent Escaping Across All Modal Paths**: Ensure `_modalEscapeHTML` is applied in the generic `confirm` method used by the auto-attach handler, not just in `confirmDelete` and `confirmUnlink`.
+
+6. **Post-Fix Verification**: Verify that a watch with URL `http://example.com#&lt;img/src=x/onerror=alert(1)&gt;` no longer executes script when the clear history or delete button is clicked.
+
+---
+
+## References
+
+- [CWE-79: Improper Neutralization of Input During Web Page Generation (Cross-Site Scripting)](https://cwe.mitre.org/data/definitions/79.html)
+- [OWASP XSS Prevention Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Cross_Site_Scripting_Prevention_Cheat_Sheet.html)
