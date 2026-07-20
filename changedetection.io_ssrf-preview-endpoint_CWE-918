@@ -1,0 +1,223 @@
+# Server-Side Request Forgery via add_watch_ui_snapshot Preview Endpoint (CWE-918)
+
+**BUG_Author:** herantong
+
+**Affected Version:** changedetection.io ≤ 0.55.8
+
+**Vendor:** [changedetection.io GitHub Repository](https://github.com/dgtlmoon/changedetection.io)
+
+**Software:** [changedetection.io](https://github.com/dgtlmoon/changedetection.io)
+
+**Vulnerability Files:**
+- `changedetectionio/blueprint/add_watch_ui/__init__.py`
+- `changedetectionio/browser_steps/browser_steps.py`
+- `changedetectionio/validate_url.py`
+
+---
+
+## Description
+
+### 1. SSRF via Unvalidated URL in Watch Preview Endpoint
+
+The `add_watch_ui_snapshot` endpoint accepts a user-supplied `url` query parameter and validates only that it starts with `http://` or `https://`. The URL is then passed directly through `browsersteps_live_ui` and `call_action('Goto site')` to a headless Playwright browser. No SSRF validation (e.g., `is_url_private_or_parser_confused`) is applied, allowing the browser to navigate to internal addresses (CWE-918).
+
+### 2. Vulnerable Code Location
+
+The vulnerability is at `changedetectionio/blueprint/add_watch_ui/__init__.py:50-69`:
+
+```python
+# changedetectionio/blueprint/add_watch_ui/__init__.py:50-69
+url = (request.args.get('url') or '').strip()
+if not url or not url.lower().startswith(('http://', 'https://')):
+    return make_response('Please enter a valid http(s):// URL', 400)
+
+async def _fetch_snapshot():
+    keepalive_ms = 30 * 1000
+    browser, playwright_context = await acquire_browser_for_fetcher(
+        fetcher_name, proxy=None, keepalive_ms=keepalive_ms
+    )
+
+    stepper = browsersteps_live_ui(playwright_browser=browser, proxy=None, start_url=url)
+    session = {'browserstepper': stepper, 'browser': browser, 'playwright_context': playwright_context}
+    try:
+        await stepper.connect(proxy=None)
+        await stepper.call_action(action_name="Goto site", selector=None, optional_value=None)
+```
+
+The `url` parameter is read directly from `request.args.get('url')`. The only validation is a protocol prefix check. The raw `url` is then passed as `start_url` to `browsersteps_live_ui` and reaches the browser navigation sink.
+
+### 3. Data Flow to the Actual Navigation Sink
+
+`changedetectionio/browser_steps/browser_steps.py:145-146`:
+```python
+async def action_goto_site(self, selector=None, value=None):
+    return await self.action_goto_url(value=re.sub(r'^source:', '', self.start_url, flags=re.IGNORECASE))
+```
+
+`changedetectionio/browser_steps/browser_steps.py:140`:
+```python
+async def action_goto_url(self, selector=None, value=None):
+    if not value:
+        logger.warning("No URL provided for goto_url action")
+        return None
+    now = time.time()
+    response = await self.page.goto(value, timeout=0, wait_until='load')
+```
+
+The attacker-controlled `url` flows: `request.args.get('url')` → `browsersteps_live_ui.start_url` → `action_goto_site` → `action_goto_url` → `page.goto(value)`. Playwright's `page.goto` initiates an outbound HTTP request, follows redirects, and renders the response.
+
+### 4. Existing SSRF Protections Are Not Applied
+
+The project has robust SSRF protections in `changedetectionio/validate_url.py` that are used in the regular fetch path but completely bypassed by the preview endpoint.
+
+**Protected path** — `changedetectionio/processors/base.py:100-115`:
+
+```python
+async def validate_iana_url(self):
+    if strtobool(os.getenv('ALLOW_IANA_RESTRICTED_ADDRESSES', 'false')):
+        return
+    loop = asyncio.get_running_loop()
+    if await loop.run_in_executor(None, is_url_private_or_parser_confused, self.watch.link):
+        raise Exception(
+            f"Fetch blocked: '{self.watch.link}' resolves to a private/reserved IP address ..."
+        )
+```
+
+This check runs in `call_browser()` for existing watches but is bypassed by `add_watch_ui_snapshot`, which directly instantiates a browser stepper and navigates without creating a watch or going through `call_browser()`.
+
+**Existing SSRF validation** — `changedetectionio/validate_url.py:119-133`:
+
+```python
+def is_url_private_or_parser_confused(url):
+    if '\\' in url:
+        logger.warning(f"URL '{url}' contains a backslash — rejected ...")
+        return True
+    for hostname in extract_url_hostnames(url):
+        if is_private_hostname(hostname):
+            return True
+    return False
+```
+
+And `is_private_hostname` at `changedetectionio/validate_url.py:68-87`:
+```python
+def is_private_hostname(hostname):
+    try:
+        for info in socket.getaddrinfo(hostname, None):
+            ip = ipaddress.ip_address(info[4][0])
+            if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved:
+                return True
+    except socket.gaierror as e:
+        return False
+    return False
+```
+
+These protections cover private, loopback, link-local, and reserved IP ranges, backslash-based parser-differential attacks, and per-redirect-hop validation in other fetchers. None are called by `add_watch_ui_snapshot`.
+
+### 5. Redirect-Hop Validation Gap
+
+The requests fetcher at `changedetectionio/content_fetchers/requests.py:92-127` validates every redirect hop:
+
+```python
+if not allow_iana_restricted:
+    if is_url_private_or_parser_confused(url):
+        raise Exception(...)
+
+r = session.request(method=request_method, ..., allow_redirects=False)
+
+for _ in range(10):
+    if not r.is_redirect:
+        break
+    location = r.headers.get('Location', '')
+    redirect_url = urljoin(current_url, location)
+    if not allow_iana_restricted:
+        if is_url_private_or_parser_confused(redirect_url):
+            raise Exception(...)
+    current_url = redirect_url
+    r = session.request('GET', redirect_url, ..., allow_redirects=False)
+```
+
+The browser-based preview path performs neither initial nor per-redirect-hop validation. An attacker can use an external URL that redirects to an internal target to bypass any future hostname-level checks.
+
+### 6. Authentication Context
+
+The endpoint uses `@login_optionally_required` from `changedetectionio/auth_decorator.py:16-42`. When the application has a password configured (typical deployment), the attacker must be authenticated to reach the sink, making this an authenticated SSRF.
+
+### 7. Code Context
+
+- The file is `changedetectionio/blueprint/add_watch_ui/__init__.py` — a production blueprint.
+- The endpoint is referenced in the frontend template `add-watch-ui.html:92` as `url_for('add_watch_ui.add_watch_ui_snapshot')`.
+- It is used to provide a live preview/screenshot when adding a new watch.
+- It is not test code, demo code, or dead code.
+
+---
+
+## Proof of Concept
+
+### 1. Direct Internal Service Access
+
+```
+GET http://<target-host>/add_watch_ui_snapshot?url=http://127.0.0.1:8080/admin
+```
+
+The server-side headless browser navigates to the internal service, rendering the response.
+
+### 2. Cloud Metadata Access
+
+```
+GET http://<target-host>/add_watch_ui_snapshot?url=http://169.254.169.254/latest/meta-data/
+```
+
+### 3. Redirect-Based Bypass
+
+If a hostname-level check were added, an attacker could bypass it using an external redirect:
+
+```
+GET http://<target-host>/add_watch_ui_snapshot?url=https://attacker.example.com/redirect?target=http://127.0.0.1:8080
+```
+
+Since `page.goto()` follows redirects automatically and no per-hop validation exists, the browser navigates to the internal target.
+
+### 4. Attack Flow
+
+1. An attacker sends a GET request to `/add_watch_ui_snapshot?url=<internal_target>`.
+2. The endpoint validates only the protocol prefix (`http://` or `https://`).
+3. The URL is passed to `browsersteps_live_ui` and reaches `page.goto()`.
+4. The server-side Playwright browser navigates to the internal URL.
+5. The attacker can access internal services, cloud metadata, or localhost endpoints.
+
+---
+
+## Root Cause Analysis
+
+| Question | Answer |
+|---|---|
+| Does user-controlled input influence the URL/host of a server-side request? | Yes — `request.args.get('url')` flows directly to `page.goto()` via `browsersteps_live_ui`. |
+| Is the target hostname/URL validated against a whitelist? | No — only a protocol prefix check is performed. |
+| Is the resolved IP checked against internal/private ranges? | No — `is_url_private_or_parser_confused` and `is_private_hostname` are not called. |
+| Is per-redirect-hop validation performed? | No — `page.goto()` follows redirects automatically without validation. |
+| Do SSRF protections exist elsewhere in the codebase? | Yes — `validate_iana_url()` in `processors/base.py` and the requests fetcher validate both initial URLs and redirects, but these are bypassed by the preview endpoint. |
+| Does the endpoint require authentication? | Conditional — `@login_optionally_required` enforces login only when a password is configured. |
+| Is the code in a test, demo, or dead-code context? | No — it is a production preview endpoint used when adding new watches. |
+
+**Verdict: Confirmed vulnerability (CWE-918 — Server-Side Request Forgery).**
+
+---
+
+## Fix Recommendations
+
+1. **Apply Existing SSRF Validation**: Call `is_url_private_or_parser_confused(url)` in `add_watch_ui_snapshot` before passing the URL to `browsersteps_live_ui`. Reject URLs that resolve to private, loopback, link-local, or reserved IP addresses.
+
+2. **Block Backslash-Containing URLs**: Reject URLs containing backslashes to prevent parser-differential SSRF attacks, consistent with the protection in `is_url_private_or_parser_confused`.
+
+3. **Add Redirect Validation**: Since `page.goto()` follows redirects, add redirect validation or disable automatic redirect following and validate each redirect target manually, consistent with the requests fetcher pattern.
+
+4. **Validate URL Scheme Beyond Prefix Check**: Use a comprehensive URL scheme whitelist rather than a simple prefix check to prevent scheme-based bypasses.
+
+5. **Post-Fix Verification**: Verify that requests to internal addresses (`127.0.0.1`, `169.254.169.254`, `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`) are rejected by the preview endpoint.
+
+---
+
+## References
+
+- [CWE-918: Server-Side Request Forgery](https://cwe.mitre.org/data/definitions/918.html)
+- [Playwright `page.goto()` documentation](https://playwright.dev/python/docs/api/class-page#page-goto)
